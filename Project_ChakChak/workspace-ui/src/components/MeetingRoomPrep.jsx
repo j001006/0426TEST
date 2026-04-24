@@ -1,6 +1,33 @@
 import React, { useState, useRef } from 'react';
 import { Mic, ArrowUp, Bot, FileText, Clock, Key, Upload } from 'lucide-react';
 
+//종범추가
+// 회의실 UI 컴포넌트 내부 상단에 추가
+// const [currentTopic, setCurrentTopic] = useState("주제를 파악 중입니다...");
+
+// useEffect(() => {
+//   const fetchTopic = async () => {
+//     try {
+//       const response = await fetch('http://127.0.0.1:8000/api/realtime-topic');
+//       const data = await response.json();
+//       setCurrentTopic(data.topic);
+//     } catch (err) {
+//       console.error("실시간 분석 오류:", err);
+//     }
+//   };
+
+//   const timer = setInterval(fetchTopic, 30000); // 30초마다 갱신 (슬라이딩 윈도우)
+//   return () => clearInterval(timer);
+// }, []);
+
+// // JSX 부분
+// <div className="w-full py-4 text-center">
+//   <h2 className="text-white text-2xl font-black tracking-tight">
+//     현재 대화 주제: <span className="text-[#9785f2] border-b-2 border-[#ff5e5e]">{currentTopic}</span>
+//   </h2>
+// </div>
+//종범추가
+
 // 새로 추가된 KeywordTags 컴포넌트
 function KeywordTags({ keywordsString }) {
   const keywordArray = keywordsString

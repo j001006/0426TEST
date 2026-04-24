@@ -33,6 +33,10 @@ export default function MeetingLiveView({ planData }) {
   const [aiResult, setAiResult] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
+  // 종범추가 실시간 주제 상태
+  const [currentTopic, setCurrentTopic] = useState("대화 분석 중...");
+  //
+
   // 스크롤을 항상 최하단으로 내리는 함수
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -41,6 +45,24 @@ export default function MeetingLiveView({ planData }) {
   useEffect(() => {
     scrollToBottom();
   }, [messages, isLoading]);
+
+  //종범추가 실시간 주제 가져오기 로직
+  useEffect(() => {
+    const fetchTopic = async () => {
+      try {
+        const response = await fetch('http://127.0.0.1:8000/api/realtime-topic');
+        const data = await response.json();
+        if (data.topic) setCurrentTopic(data.topic);
+      } catch (err) {
+        console.error("실시간 주제 분석 오류:", err);
+      }
+    };
+
+    fetchTopic(); // 처음 로드될 때 한 번 실행
+    const timer = setInterval(fetchTopic, 30000); // 30초마다 반복 실행
+    return () => clearInterval(timer); // 컴포넌트 종료 시 타이머 해제
+  }, []);
+  //
 
   // 메시지 전송 로직
   const handleSendMessage = async (text) => {
@@ -109,6 +131,28 @@ export default function MeetingLiveView({ planData }) {
             <span className="text-white/90 font-medium text-[13px]">참여자 4명</span>
           </div>
         </div>
+
+        //종범추가
+        <div className="w-full mb-4 animate-in fade-in slide-in-from-top-4 duration-700">
+          <div className="bg-[#1e1f35] rounded-3xl py-5 px-8 border border-white/10 shadow-2xl flex items-center justify-between">
+            <div className="flex items-center gap-3 shrink-0">
+              <div className="w-2.5 h-2.5 bg-rose-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(244,63,94,0.6)]" />
+              <span className="text-gray-400 font-bold text-[11px] uppercase tracking-[0.2em]">Live Context</span>
+            </div>
+            
+            <div className="flex-1 text-center">
+              <h2 className="text-white text-2xl font-black tracking-tight">
+                " <span className="text-transparent bg-clip-text bg-gradient-to-r from-[#9785f2] to-[#ff5e5e]">{currentTopic}</span> "
+              </h2>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0 text-white/30 text-[10px] font-mono">
+              <Activity className="w-3 h-3" />
+              ANALYZING...
+            </div>
+          </div>
+        </div>
+        //
 
         {/* STT Workspace Area */}
         {isSttOpen && (
