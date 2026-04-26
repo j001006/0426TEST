@@ -4,7 +4,7 @@ import { createMeetingSession } from '../services/realtimeMeetingService'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 
-export default function MeetingRoomPrep({ onStartMeeting }) {
+export default function MeetingRoomPrep({ roomName, onStartMeeting }) {
   const [meetingTitle, setMeetingTitle] = useState('')
   const [meetingType, setMeetingType] = useState('general')
   const [meetingTime, setMeetingTime] = useState('')
@@ -36,6 +36,11 @@ export default function MeetingRoomPrep({ onStartMeeting }) {
 
   const handleStartMeeting = async () => {
     if (isStarting) return
+    
+    if (!roomName) {
+      setErrorText('먼저 룸을 선택해야 합니다.')
+      return
+    }
 
     setIsStarting(true)
     setErrorText('')
@@ -48,6 +53,9 @@ export default function MeetingRoomPrep({ onStartMeeting }) {
         .join('\n\n')
 
       const payload = {
+        roomName,
+        room_name: roomName,
+
         title: meetingTitle.trim() || '새 회의',
         meetingTitle: meetingTitle.trim() || '새 회의',
         meeting_type: meetingType,
@@ -77,6 +85,8 @@ export default function MeetingRoomPrep({ onStartMeeting }) {
       const merged = {
         ...payload,
         ...session,
+        roomName: session?.roomName || session?.room_name || roomName,
+        room_name: session?.room_name || session?.roomName || roomName,
         sessionId,
         id: sessionId,
         planFileName: planFile?.name || '',
@@ -98,6 +108,9 @@ export default function MeetingRoomPrep({ onStartMeeting }) {
     <div className="flex-1 h-full overflow-y-auto bg-[#f7f8fb]">
       <div className="max-w-5xl mx-auto px-8 py-10">
         <h1 className="text-3xl font-black text-gray-900">실시간 회의 준비</h1>
+        <p className="mt-2 text-sm text-blue-600 font-semibold">
+          현재 룸: {roomName || '룸 미선택'}
+        </p>
         <p className="text-sm text-gray-500 mt-2">
           회의 정보를 입력하고 회의 시작을 누르면 sessionId가 생성됩니다.
         </p>

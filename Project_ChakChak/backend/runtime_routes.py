@@ -7,6 +7,22 @@ from pathlib import Path
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 
+from storage_paths import (
+    get_room_sessions_dir,
+    get_session_dir,
+    get_live_recordings_dir,
+    get_post_meeting_recordings_dir,
+    get_meeting_plan_dir,
+    get_knowledge_dir,
+    sanitize_room_name,
+)
+
+from session_db import (
+    init_session_databases,
+    insert_live_transcript,
+    insert_post_summary,
+)
+
 router = APIRouter()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -170,6 +186,7 @@ def ensure_tables():
     cur.execute("""
     CREATE TABLE IF NOT EXISTS meeting_sessions (
         id TEXT PRIMARY KEY,
+        room_name TEXT DEFAULT 'default_room',
         title TEXT NOT NULL,
         meeting_time TEXT,
         keywords TEXT,
@@ -180,7 +197,33 @@ def ensure_tables():
         status TEXT DEFAULT 'live'
     )
     """)
+    
+    cur.execute("PRAGMA table_info(meeting_sessions)")
+    cols = {row[1] for row in cur.fetchall()}
 
+    if "room_name" not in cols:
+        cur.execute("ALTER TABLE meeting_sessions ADD COLUMN room_name TEXT DEFAULT 'default_room'")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS rooms (
+        id TEXT PRIMARY KEY,
+        room_name TEXT UNIQUE NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS room_members (
+        id TEXT PRIMARY KEY,
+        room_name TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        role TEXT DEFAULT 'member',
+        created_at TEXT NOT NULL,
+        UNIQUE(room_name, user_id)
+    )
+    """)
+    
     cur.execute("""
     CREATE TABLE IF NOT EXISTS library_items (
         id TEXT PRIMARY KEY,
@@ -225,6 +268,20 @@ def ensure_tables():
 def row_to_dict(row):
     return dict(row) if row else None
 
+def get_room_name_by_session_id(session_id: str) -> str:
+    ensure_tables()
+
+    c = conn()
+    row = c.execute(
+        "SELECT room_name FROM meeting_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    c.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="회의 세션을 찾을 수 없습니다.")
+
+    return sanitize_room_name(row["room_name"] or "default_room")
 
 def save_library_item(session_id, bucket, kind, name, file_path, text_content=""):
     ensure_tables()
@@ -277,6 +334,8 @@ class MeetingCreatePayload(BaseModel):
     planText: str | None = None
     realtime_recording_enabled: bool | None = True
     realtimeRecordingEnabled: bool | None = True
+    room_name: str | None = None
+    roomName: str | None = None
 
 
 @router.post("/meeting/session/create")
@@ -287,6 +346,11 @@ def create_meeting_session(payload: MeetingCreatePayload):
     now = datetime.now().isoformat()
 
     title = payload.title or payload.meetingTitle or "새 회의"
+    room_name = sanitize_room_name(payload.room_name or payload.roomName or "default_room")
+    session_dir = get_session_dir(room_name, session_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    init_session_databases(room_name, session_id)
     meeting_type = payload.meeting_type or payload.meetingType or "general"
     meeting_time = payload.meeting_time or payload.meetingTime or now
     keywords = payload.keywords or ""
@@ -294,11 +358,14 @@ def create_meeting_session(payload: MeetingCreatePayload):
 
     c = conn()
     c.execute("""
-    INSERT INTO meeting_sessions
-    (id, title, meeting_time, keywords, meeting_type, realtime_recording_enabled, created_at, stopped_at, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO meeting_sessions (
+        id, room_name, title, meeting_time, keywords, meeting_type,
+        realtime_recording_enabled, created_at, stopped_at, status
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         session_id,
+        room_name,
         title,
         meeting_time,
         keywords,
@@ -312,7 +379,7 @@ def create_meeting_session(payload: MeetingCreatePayload):
     c.close()
 
     if plan_text.strip():
-        plan_dir = DATA_DIR / "sessions" / session_id / "meeting_plan"
+        plan_dir = get_meeting_plan_dir(room_name, session_id)
         plan_dir.mkdir(parents=True, exist_ok=True)
         plan_path = plan_dir / "meeting_plan.txt"
         plan_path.write_text(plan_text, encoding="utf-8")
@@ -329,11 +396,13 @@ def create_meeting_session(payload: MeetingCreatePayload):
     return {
         "sessionId": session_id,
         "id": session_id,
+        "roomName": room_name,
         "title": title,
         "meetingType": meeting_type,
         "meetingTime": meeting_time,
         "keywords": keywords,
         "status": "live",
+        "sessionDir": str(session_dir),
     }
 
 
@@ -355,7 +424,8 @@ def get_meeting_session(session_id: str):
 @router.post("/meeting/session/{session_id}/plan")
 async def upload_meeting_plan(session_id: str, file: UploadFile = File(...)):
     ensure_tables()
-    target_dir = DATA_DIR / "sessions" / session_id / "meeting_plan"
+    room_name = get_room_name_by_session_id(session_id)
+    target_dir = get_meeting_plan_dir(room_name, session_id)
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / file.filename
     content = await file.read()
@@ -374,7 +444,8 @@ async def upload_meeting_plan(session_id: str, file: UploadFile = File(...)):
 @router.post("/meeting/session/{session_id}/knowledge")
 async def upload_meeting_knowledge(session_id: str, file: UploadFile = File(...)):
     ensure_tables()
-    target_dir = DATA_DIR / "sessions" / session_id / "knowledge"
+    room_name = get_room_name_by_session_id(session_id)
+    target_dir = get_knowledge_dir(room_name, session_id)
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / file.filename
     content = await file.read()
@@ -480,7 +551,8 @@ async def upload_realtime_chunk(
     offset_sec: float = Form(0),
 ):
     ensure_tables()
-    target_dir = DATA_DIR / "sessions" / session_id / "live_recordings"
+    room_name = get_room_name_by_session_id(session_id)
+    target_dir = get_live_recordings_dir(room_name, session_id)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     path = target_dir / f"chunk_{int(offset_sec)}_{file.filename}"
@@ -522,6 +594,16 @@ async def upload_realtime_chunk(
             "transcript": "",
         }
 
+    insert_live_transcript(
+        room_name=room_name,
+        session_id=session_id,
+        text=transcript,
+        speaker="익명1",
+        start_sec=offset_sec,
+        end_sec=offset_sec,
+        source_file=str(path),
+    )
+    
     item = save_library_item(
         session_id=session_id,
         bucket="live_recordings",
@@ -596,6 +678,8 @@ def read_session_transcript(session_id: str):
 @router.post("/meeting/session/{session_id}/stop")
 def stop_meeting(session_id: str):
     ensure_tables()
+    
+    room_name = get_room_name_by_session_id(session_id)
     now = datetime.now().isoformat()
 
     transcript = read_session_transcript(session_id)
@@ -610,10 +694,18 @@ def stop_meeting(session_id: str):
     c.commit()
     c.close()
 
-    target_dir = DATA_DIR / "sessions" / session_id / "post_meeting_recordings"
+    room_name = get_room_name_by_session_id(session_id)
+    target_dir = get_post_meeting_recordings_dir(room_name, session_id)
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / "final_summary.md"
     path.write_text(final_summary, encoding="utf-8")
+
+    insert_post_summary(
+        room_name=room_name,
+        session_id=session_id,
+        summary=final_summary,
+        full_transcript=transcript,
+    )
 
     save_library_item(
         session_id=session_id,

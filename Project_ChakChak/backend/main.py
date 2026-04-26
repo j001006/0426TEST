@@ -68,6 +68,18 @@ except Exception as e:
 
 from runtime_routes import router as runtime_router
 
+try:
+    from room_api import router as room_router
+except Exception as e:
+    room_router = None
+    print(f"[WARN] room_api import failed: {e}")
+
+try:
+    from calendar_api import router as calendar_router
+except Exception as e:
+    calendar_router = None
+    print(f"[WARN] calendar_api import failed: {e}")
+
 app = FastAPI(title="ChakChak 0424test + Sinwoo merged backend")
 
 app.add_middleware(
@@ -136,3 +148,9 @@ if chak_runtime_app is not None:
 
 
 app.include_router(runtime_router)
+
+if room_router is not None:
+    app.include_router(room_router)
+
+if calendar_router is not None:
+    app.include_router(calendar_router)
