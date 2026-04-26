@@ -1,327 +1,718 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Mic, Users, Activity, Bot, Sparkles, Pause, Square, Send, FileAudio } from 'lucide-react';
-import { chatWithAI, summarizeMeeting } from '../services/aiService';
-import STTWorkspace from './STTWorkspace';
-import AIInsightPanel from './AIInsightPanel';
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  Bot,
+  FileUp,
+  Loader2,
+  Mic,
+  MicOff,
+  Pause,
+  Play,
+  RefreshCw,
+  Send,
+  Square,
+  Upload,
+  Wifi,
+  WifiOff,
+} from 'lucide-react'
+import {
+  getMeetingDetail,
+  getMeetingFeedback,
+  getMeetingLibraryTree,
+  getMeetingMidSummary,
+  getRealtimeTopic,
+  stopRealtimeMeeting,
+  uploadKnowledgeFile,
+  uploadMeetingPlanFile,
+  uploadRealtimeChunk,
+} from '../services/realtimeMeetingService'
+import { chatWithAI } from '../services/aiService'
+import { logMeetingAIEvent, regenerateMeetingReport } from '../services/meetingReportService'
 
+const CHUNK_MS = 15000
 
-import AgendaSidebar from './AgendaSidebar'; 
+function nowTime() {
+  return new Date().toLocaleTimeString('ko-KR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  })
+}
 
-export default function MeetingLiveView({ planData }) {
-  // 업로드된 데이터가 없을 경우 표시할 기본값
-  const data = planData || {
-    title: "새로운 즉석 회의", 
-    time: "진행 중", 
-    keywords: "자유주제" 
-  };
-  
-  // 아젠다가 없을 경우 기본 메시지
-  const agendas = data.agendas || ["회의 안건을 기반으로 논의를 시작하세요."];
+function formatSec(sec = 0) {
+  sec = Math.max(0, Math.floor(sec))
+  const h = Math.floor(sec / 3600)
+  const m = Math.floor((sec % 3600) / 60)
+  const s = sec % 60
+  if (h > 0) return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+}
 
-  // 대화 내역 상태
+export default function MeetingLiveView({
+  planData,
+  useWebSearch = false,
+  setUseWebSearch,
+  onOpenMeetingReport,
+}) {
+  const sessionId = planData?.sessionId || planData?.id
+  const [meetingDetail, setMeetingDetail] = useState(null)
+  const [libraryTree, setLibraryTree] = useState(null)
+
   const [messages, setMessages] = useState([
-    { sender: 'ai', text: '회의가 시작되었습니다. 우측의 STT 기능을 통해 음성을 올리고 아이디어를 물어보세요!' }
-  ]);
-  const [inputValue, setInputValue] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const messagesEndRef = useRef(null);
-  
-  // STT 패널 열기/닫기 (공간 확보용)
-  const [isSttOpen, setIsSttOpen] = useState(true);
+    {
+      sender: 'system',
+      text: '회의가 시작되었습니다. 녹음을 시작하고 AI에게 질문할 수 있습니다.',
+      time: nowTime(),
+    },
+  ])
+  const [inputValue, setInputValue] = useState('')
+  const [isChatLoading, setIsChatLoading] = useState(false)
 
-  // 실시간 AI 요약 패널 상태
-  const [aiResult, setAiResult] = useState(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [liveTranscriptItems, setLiveTranscriptItems] = useState([])
+  const [currentTopic, setCurrentTopic] = useState('아직 분석된 주제가 없습니다.')
+  const [topicHistory, setTopicHistory] = useState([])
 
-  // 종범추가 실시간 주제 상태
-  const [currentTopic, setCurrentTopic] = useState("대화 분석 중...");
-  //
+  const [isRecording, setIsRecording] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
+  const [recordingError, setRecordingError] = useState('')
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
 
-  // 스크롤을 항상 최하단으로 내리는 함수
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  const [meetingPlanFile, setMeetingPlanFile] = useState(null)
+  const [knowledgeFile, setKnowledgeFile] = useState(null)
+  const [uploadStatus, setUploadStatus] = useState('')
+
+  const [isSummaryLoading, setIsSummaryLoading] = useState(false)
+  const [isFeedbackLoading, setIsFeedbackLoading] = useState(false)
+  const [isStopping, setIsStopping] = useState(false)
+
+  const mediaRecorderRef = useRef(null)
+  const streamRef = useRef(null)
+  const startedAtRef = useRef(null)
+  const chunkOffsetRef = useRef(0)
+  const messagesEndRef = useRef(null)
+  const transcriptEndRef = useRef(null)
+  const topicTimerRef = useRef(null)
+  const elapsedTimerRef = useRef(null)
+  const isRecordingRef = useRef(false)
+  const isPausedRef = useRef(false)
+
+  const meetingTitle = planData?.title || planData?.meetingTitle || meetingDetail?.title || '실시간 회의'
+  const meetingType = planData?.meetingType || planData?.meeting_type || meetingDetail?.meetingType || 'general'
+  const meetingTime = planData?.meetingTime || planData?.meeting_time || meetingDetail?.meetingTime || ''
+  const keywords = planData?.keywords || meetingDetail?.keywords || ''
+
+  const transcriptText = useMemo(() => {
+    return liveTranscriptItems
+      .map((item) => item.previewLine || item.transcript || item.text || '')
+      .filter(Boolean)
+      .join('\n')
+  }, [liveTranscriptItems])
+
+  const appendMessage = (sender, text) => {
+    setMessages((prev) => [
+      ...prev,
+      { sender, text, time: nowTime() },
+    ])
+  }
+
+  const scrollChatBottom = () => {
+    setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
+  }
+
+  const scrollTranscriptBottom = () => {
+    setTimeout(() => transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
+  }
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, isLoading]);
+    scrollChatBottom()
+  }, [messages])
 
-  //종범추가 실시간 주제 가져오기 로직
   useEffect(() => {
-    const fetchTopic = async () => {
-      try {
-        const response = await fetch('http://127.0.0.1:8000/api/realtime-topic');
-        const data = await response.json();
-        if (data.topic) setCurrentTopic(data.topic);
-      } catch (err) {
-        console.error("실시간 주제 분석 오류:", err);
+    scrollTranscriptBottom()
+  }, [liveTranscriptItems])
+
+  const refreshMeeting = async () => {
+    if (!sessionId) return
+
+    try {
+      const detail = await getMeetingDetail(sessionId)
+      setMeetingDetail(detail)
+    } catch (e) {
+      console.warn(e)
+    }
+
+    try {
+      const tree = await getMeetingLibraryTree(sessionId)
+      setLibraryTree(tree)
+
+      const candidates = [
+        ...(tree?.liveRecordings || []),
+        ...(tree?.live_recordings || []),
+        ...(tree?.realtimeMeetings || []),
+        ...(tree?.postMeetingRecordings || []),
+      ]
+
+      const normalized = candidates
+        .map((item, idx) => ({
+          id: item.id || `${idx}-${item.createdAt || Date.now()}`,
+          previewLine:
+            item.previewLine ||
+            item.preview_line ||
+            item.textContent ||
+            item.text_content ||
+            item.transcript ||
+            item.text ||
+            item.name ||
+            '',
+          createdAt: item.createdAt || item.created_at || '',
+          kind: item.kind || '',
+        }))
+        .filter((item) => item.previewLine)
+
+      if (normalized.length > 0) {
+        setLiveTranscriptItems(normalized)
       }
-    };
+    } catch (e) {
+      console.warn(e)
+    }
+  }
 
-    fetchTopic(); // 처음 로드될 때 한 번 실행
-    const timer = setInterval(fetchTopic, 30000); // 30초마다 반복 실행
-    return () => clearInterval(timer); // 컴포넌트 종료 시 타이머 해제
-  }, []);
-  //
+  const pollRealtimeTopic = async () => {
+    try {
+      const result = await getRealtimeTopic()
+      const topic = result?.topic || result?.currentTopic || result?.summary || ''
+      if (!topic) return
 
-  // 메시지 전송 로직
-  const handleSendMessage = async (text) => {
-    const trimmedText = text.trim();
-    if (!trimmedText || isLoading) return;
+      setCurrentTopic(topic)
+      setTopicHistory((prev) => {
+        const last = prev[prev.length - 1]
+        if (last?.topic === topic) return prev
+        return [
+          ...prev,
+          {
+            id: Date.now().toString(),
+            topic,
+            time: formatSec(elapsedSeconds),
+          },
+        ].slice(-20)
+      })
+    } catch (e) {
+      console.warn('실시간 주제 분석 오류:', e)
+    }
+  }
+
+  useEffect(() => {
+    refreshMeeting()
+  }, [sessionId])
+
+  useEffect(() => {
+    if (!sessionId) return
+
+    topicTimerRef.current = setInterval(() => {
+      pollRealtimeTopic()
+      refreshMeeting()
+    }, 30000)
+
     
-    setMessages((prev) => [...prev, { sender: 'user', text: trimmedText }]);
-    setInputValue('');
-    setIsLoading(true);
+  console.log('MeetingLiveView planData:', planData)
+  console.log('MeetingLiveView sessionId:', sessionId)
+
+return () => {
+      if (topicTimerRef.current) clearInterval(topicTimerRef.current)
+    }
+  }, [sessionId, elapsedSeconds])
+
+  useEffect(() => {
+    if (!isRecording || isPaused) return
+
+    elapsedTimerRef.current = setInterval(() => {
+      if (!startedAtRef.current) return
+      setElapsedSeconds(Math.floor((Date.now() - startedAtRef.current) / 1000))
+    }, 1000)
+
+    return () => {
+      if (elapsedTimerRef.current) clearInterval(elapsedTimerRef.current)
+    }
+  }, [isRecording, isPaused])
+
+  const uploadAudioBlob = async (blob, offset) => {
+    if (!blob || blob.size < 4096) return
 
     try {
-      const response = await chatWithAI(trimmedText);
-      setMessages((prev) => [...prev, { sender: 'ai', text: response }]);
-    } catch (error) {
-      console.error(error);
-      setMessages((prev) => [
-        ...prev, 
-        { sender: 'ai', text: '네트워크 연결이 지연되고 있거나 AI 서버 오류가 발생했습니다. 다시 시도해주세요.' }
-      ]);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+      const result = await uploadRealtimeChunk(sessionId, blob, offset)
 
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
-      e.preventDefault();
-      handleSendMessage(inputValue);
-    }
-  };
+      console.log('REALTIME CHUNK RESULT:', result)
 
-  // 요약 데이터 불러오기
-  const handleFetchInsight = async () => {
-    setIsAnalyzing(true);
+      if (result?.skipped) {
+        console.warn('STT chunk skipped:', result)
+        return
+      }
+
+      const transcript =
+        result?.transcript ||
+        result?.item?.textContent ||
+        result?.item?.text_content ||
+        result?.item?.previewLine ||
+        result?.item?.preview_line ||
+        result?.previewLine ||
+        ''
+
+      console.log('REALTIME TRANSCRIPT:', transcript)
+
+      if (transcript && transcript.trim()) {
+        setLiveTranscriptItems((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-${Math.random()}`,
+            previewLine: transcript,
+            transcript,
+            createdAt: new Date().toISOString(),
+            kind: 'realtime_audio_chunk_transcript',
+          },
+        ])
+      }
+
+      await refreshMeeting()
+    } catch (e) {
+      console.error(e)
+      setRecordingError(e.message || '실시간 녹음 chunk 업로드에 실패했습니다.')
+    }
+  }
+
+  const startRecorderCycle = (stream) => {
+    if (!streamRef.current || !isRecordingRef.current || isPausedRef.current) return
+
+    const mimeCandidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+    const selectedMime = mimeCandidates.find((m) => window.MediaRecorder?.isTypeSupported?.(m)) || ''
+
+    const recorder = selectedMime
+      ? new MediaRecorder(stream, { mimeType: selectedMime })
+      : new MediaRecorder(stream)
+
+    const chunks = []
+    const offset = chunkOffsetRef.current
+
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) chunks.push(event.data)
+    }
+
+    recorder.onstop = async () => {
+      if (chunks.length > 0) {
+        const blob = new Blob(chunks, { type: selectedMime || 'audio/webm' })
+        await uploadAudioBlob(blob, offset)
+        chunkOffsetRef.current += CHUNK_MS / 1000
+      }
+
+      if (isRecordingRef.current && !isPausedRef.current) {
+        startRecorderCycle(stream)
+      }
+    }
+
+    mediaRecorderRef.current = recorder
+    recorder.start()
+
+    setTimeout(() => {
+      if (recorder.state === 'recording') {
+        recorder.stop()
+      }
+    }, CHUNK_MS)
+  }
+
+  const startRecording = async () => {
+    if (!sessionId) {
+      setRecordingError('sessionId가 없어 녹음을 시작할 수 없습니다.')
+      return
+    }
+
     try {
-      const sessionId = data.sessionId || 1;
-      const result = await summarizeMeeting(sessionId);
-      setAiResult(result);
-    } catch (error) {
-      console.error('요약 가져오기 실패:', error);
-      alert('AI 요약 데이터를 가져오는 중 오류가 발생했습니다.');
-    } finally {
-      setIsAnalyzing(false);
+      setRecordingError('')
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      streamRef.current = stream
+
+      startedAtRef.current = Date.now()
+      chunkOffsetRef.current = 0
+
+      isRecordingRef.current = true
+      isPausedRef.current = false
+
+      setIsRecording(true)
+      setIsPaused(false)
+
+      startRecorderCycle(stream)
+
+      appendMessage('system', '실시간 녹음이 시작되었습니다.')
+    } catch (e) {
+      console.error(e)
+      setRecordingError(e.message || '마이크 접근 또는 녹음 시작 실패')
     }
-  };
+  }
+
+  const pauseRecording = () => {
+    const recorder = mediaRecorderRef.current
+    if (!recorder || recorder.state !== 'recording') return
+
+    recorder.pause()
+    isPausedRef.current = true
+    setIsPaused(true)
+    appendMessage('system', '회의 녹음이 일시정지되었습니다.')
+  }
+
+  const resumeRecording = () => {
+    const recorder = mediaRecorderRef.current
+    if (!recorder || recorder.state !== 'paused') return
+
+    recorder.resume()
+    isPausedRef.current = false
+    setIsPaused(false)
+    startRecorderCycle(streamRef.current)
+    appendMessage('system', '회의 녹음이 재개되었습니다.')
+  }
+
+  const stopRecordingOnly = () => {
+    try {
+      const recorder = mediaRecorderRef.current
+      if (recorder && recorder.state !== 'inactive') {
+        if (recorder.state === 'recording') recorder.requestData()
+        recorder.stop()
+      }
+      streamRef.current?.getTracks?.().forEach((track) => track.stop())
+    } catch (e) {
+      console.warn(e)
+    } finally {
+      isRecordingRef.current = false
+      isPausedRef.current = false
+      setIsRecording(false)
+      setIsPaused(false)
+      appendMessage('system', '실시간 녹음이 중지되었습니다.')
+    }
+  }
+
+  const askPreset = async (prompt) => {
+    setInputValue(prompt)
+    setTimeout(() => {
+      const event = new Event('submit', { bubbles: true, cancelable: true })
+      const form = document.getElementById('live-ai-chat-form')
+      form?.dispatchEvent(event)
+    }, 50)
+  }
+
+  const handleAskAI = async () => {
+    const text = inputValue.trim()
+    if (!text || isChatLoading) return
+
+    const askedAtSec = elapsedSeconds
+    setInputValue('')
+    appendMessage('user', text)
+    setIsChatLoading(true)
+
+    try {
+      const answer = await chatWithAI(text, transcriptText, 'realtime', {
+        sessionId,
+        meetingType,
+        meetingTitle,
+        meetingTime,
+        keywords,
+        purpose: 'live_meeting_chat',
+        useWeb: useWebSearch,
+      })
+
+      appendMessage('ai', answer)
+
+      try {
+        await logMeetingAIEvent({
+          sessionId,
+          question: text,
+          answer,
+          askedAtSec,
+          beforeContext: transcriptText,
+          afterContext: '',
+        })
+      } catch (e) {
+        console.warn(e)
+      }
+    } catch (e) {
+      appendMessage('ai', `AI 응답 오류: ${e.message}`)
+    } finally {
+      setIsChatLoading(false)
+    }
+  }
+
+  const handleMidSummary = async () => {
+    if (!sessionId || isSummaryLoading) return
+
+    setIsSummaryLoading(true)
+    try {
+      const result = await getMeetingMidSummary(sessionId)
+      appendMessage('ai', `[중간 요약]\n${result?.summary || result?.message || JSON.stringify(result, null, 2)}`)
+    } catch (e) {
+      appendMessage('ai', `중간 요약 실패: ${e.message}`)
+    } finally {
+      setIsSummaryLoading(false)
+    }
+  }
+
+  const handleFeedback = async () => {
+    if (!sessionId || isFeedbackLoading) return
+
+    setIsFeedbackLoading(true)
+    try {
+      const result = await getMeetingFeedback(sessionId)
+      appendMessage('ai', `[회의 피드백]\n${result?.feedback || result?.message || JSON.stringify(result, null, 2)}`)
+    } catch (e) {
+      appendMessage('ai', `회의 피드백 실패: ${e.message}`)
+    } finally {
+      setIsFeedbackLoading(false)
+    }
+  }
+
+  const handleUploadPlan = async () => {
+    if (!sessionId || !meetingPlanFile) return
+
+    setUploadStatus('회의 계획서 업로드 중...')
+    try {
+      await uploadMeetingPlanFile(sessionId, meetingPlanFile)
+      setMeetingPlanFile(null)
+      setUploadStatus('회의 계획서 업로드 완료')
+      await refreshMeeting()
+    } catch (e) {
+      setUploadStatus(`회의 계획서 업로드 실패: ${e.message}`)
+    }
+  }
+
+  const handleUploadKnowledge = async () => {
+    if (!sessionId || !knowledgeFile) return
+
+    setUploadStatus('회의 참고자료 업로드 중...')
+    try {
+      await uploadKnowledgeFile(sessionId, knowledgeFile)
+      setKnowledgeFile(null)
+      setUploadStatus('회의 참고자료 업로드 완료')
+      await refreshMeeting()
+    } catch (e) {
+      setUploadStatus(`회의 참고자료 업로드 실패: ${e.message}`)
+    }
+  }
+
+  const handleStopMeeting = async () => {
+    if (!sessionId || isStopping) return
+
+    setIsStopping(true)
+    appendMessage('system', '회의를 종료하고 전체 STT 기반 회의 분석을 생성하는 중입니다...')
+
+    try {
+      if (isRecording) {
+        stopRecordingOnly()
+        await new Promise((resolve) => setTimeout(resolve, 1200))
+      }
+
+      const result = await stopRealtimeMeeting(sessionId)
+
+      if (result?.finalSummary) {
+        appendMessage('ai', `[최종 회의록 초안]\n${result.finalSummary}`)
+      }
+
+      appendMessage('system', '전체 STT를 SLM으로 재분석합니다.')
+
+      try {
+        await regenerateMeetingReport(sessionId)
+      } catch (e) {
+        appendMessage('system', `회의 분석 재생성 경고: ${e.message}`)
+      }
+
+      appendMessage('system', '회의 분석이 완료되었습니다. 분석 화면으로 이동합니다.')
+      onOpenMeetingReport?.(sessionId)
+    } catch (e) {
+      appendMessage('system', `회의 종료 실패: ${e.message}`)
+    } finally {
+      setIsStopping(false)
+    }
+  }
 
   return (
-    <div className="w-full h-full flex bg-[#131521] overflow-hidden font-sans">
-      
-      <AgendaSidebar data={data} agendas={agendas} />
+    <div className="flex-1 h-full bg-[#111322] text-gray-900 overflow-hidden flex flex-col">
+      <header className="h-20 px-8 flex items-center justify-between shrink-0 text-white">
+        <div>
+          <div className="text-xs tracking-[0.3em] text-pink-400 font-bold">LIVE CONTEXT</div>
+          <h1 className="text-2xl font-black mt-1">"{currentTopic}"</h1>
+        </div>
 
-      {/* 2. Main Center */}
-      <div className="flex-1 flex flex-col relative p-6 min-h-0">
-        
-        {/* Top Header info */}
-        <div className="flex justify-end items-center mb-3 px-2 shrink-0">
-          <button 
-            onClick={() => setIsSttOpen(!isSttOpen)}
-            className="mr-3 px-3 py-1.5 rounded-full border border-white/20 text-white/80 text-xs hover:bg-white/10 transition-colors flex items-center gap-2"
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setUseWebSearch?.(!useWebSearch)}
+            className={`h-10 px-4 rounded-2xl font-bold inline-flex items-center gap-2 ${
+              useWebSearch ? 'bg-emerald-500 text-white' : 'bg-gray-700 text-gray-200'
+            }`}
           >
-            <FileAudio className="w-3 h-3" />
-            {isSttOpen ? 'STT 패널 접기' : 'STT 패널 열기'}
+            {useWebSearch ? <Wifi className="w-4 h-4" /> : <WifiOff className="w-4 h-4" />}
+            웹검색 {useWebSearch ? 'ON' : 'OFF'}
           </button>
-          <div className="flex items-center bg-white/10 backdrop-blur-md px-4 py-2 rounded-full border border-white/5 shadow-lg">
-            <Users className="w-4 h-4 text-white/70 mr-2" />
-            <span className="text-white/90 font-medium text-[13px]">참여자 4명</span>
+
+          <div className="h-10 px-4 rounded-2xl bg-white/10 flex items-center text-sm">
+            {formatSec(elapsedSeconds)}
           </div>
+
+          {!isRecording ? (
+            <button onClick={startRecording} className="h-10 px-4 rounded-2xl bg-blue-600 text-white font-bold inline-flex items-center gap-2">
+              <Mic className="w-4 h-4" /> 녹음 시작
+            </button>
+          ) : isPaused ? (
+            <button onClick={resumeRecording} className="h-10 px-4 rounded-2xl bg-emerald-600 text-white font-bold inline-flex items-center gap-2">
+              <Play className="w-4 h-4" /> 재개
+            </button>
+          ) : (
+            <button onClick={pauseRecording} className="h-10 px-4 rounded-2xl bg-amber-500 text-white font-bold inline-flex items-center gap-2">
+              <Pause className="w-4 h-4" /> 일시정지
+            </button>
+          )}
+
+          {isRecording && (
+            <button onClick={stopRecordingOnly} className="h-10 px-4 rounded-2xl bg-red-600 text-white font-bold inline-flex items-center gap-2">
+              <MicOff className="w-4 h-4" /> 녹음 중지
+            </button>
+          )}
+
+          <button
+            onClick={handleStopMeeting}
+            disabled={isStopping}
+            className="h-10 px-4 rounded-2xl bg-white text-gray-900 font-black inline-flex items-center gap-2 disabled:opacity-50"
+          >
+            {isStopping ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-4 h-4" />}
+            회의 종료
+          </button>
         </div>
+      </header>
 
-        //종범추가
-        <div className="w-full mb-4 animate-in fade-in slide-in-from-top-4 duration-700">
-          <div className="bg-[#1e1f35] rounded-3xl py-5 px-8 border border-white/10 shadow-2xl flex items-center justify-between">
-            <div className="flex items-center gap-3 shrink-0">
-              <div className="w-2.5 h-2.5 bg-rose-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(244,63,94,0.6)]" />
-              <span className="text-gray-400 font-bold text-[11px] uppercase tracking-[0.2em]">Live Context</span>
-            </div>
-            
-            <div className="flex-1 text-center">
-              <h2 className="text-white text-2xl font-black tracking-tight">
-                " <span className="text-transparent bg-clip-text bg-gradient-to-r from-[#9785f2] to-[#ff5e5e]">{currentTopic}</span> "
-              </h2>
-            </div>
-
-            <div className="flex items-center gap-2 shrink-0 text-white/30 text-[10px] font-mono">
-              <Activity className="w-3 h-3" />
-              ANALYZING...
-            </div>
-          </div>
+      {recordingError && (
+        <div className="mx-8 mb-4 rounded-2xl bg-red-50 text-red-600 px-5 py-3 text-sm">
+          {recordingError}
         </div>
-        //
+      )}
 
-        {/* STT Workspace Area */}
-        {isSttOpen && (
-          <div className="bg-white rounded-3xl shadow-2xl mb-4 flex flex-col overflow-hidden border border-white/20 h-[45vh] shrink-0 transition-all duration-300">
-            <div className="bg-slate-50 border-b border-gray-100 py-3 px-6 flex items-center justify-between shrink-0">
-               <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2"><Mic className="w-4 h-4 text-blue-600"/> 음성 기록 및 변환 (STT)</h3>
-            </div>
-            <STTWorkspace />
+      <main className="flex-1 min-h-0 bg-white rounded-t-[2rem] mx-6 overflow-hidden grid grid-cols-[minmax(360px,0.75fr)_minmax(0,1.25fr)_360px]">
+        <section className="min-h-0 border-r border-gray-200 flex flex-col">
+          <div className="h-16 px-5 flex items-center gap-2 border-b border-gray-200 shrink-0">
+            <Bot className="w-5 h-5 text-blue-600" />
+            <div className="font-black">AI 실시간 어시스턴트</div>
           </div>
-        )}
 
-        {/* The Main Container */}
-        <div className="flex-1 bg-white rounded-[2rem] shadow-2xl flex flex-col md:flex-row overflow-hidden border border-white/20 min-h-0">
-          
-          {/* Left: Chatting area */}
-          <div className="flex-1 flex flex-col border-r border-gray-100 bg-white min-w-[300px]">
-            <div className="flex items-center px-8 py-5 border-b border-gray-50 bg-white z-10 shadow-sm">
-              <Bot className="w-5 h-5 text-blue-600 mr-2" />
-              <h2 className="text-[15px] font-extrabold text-gray-800 tracking-tight">AI 실시간 어시스턴트</h2>
-            </div>
-            
-            {/* Messages */}
-            <div className="flex-1 p-8 overflow-y-auto space-y-6 bg-slate-50/30">
-              {messages.map((msg, idx) => (
-                msg.sender === 'user' ? (
-                  <div key={idx} className="flex justify-end transform transition-all duration-300">
-                    <div className="bg-[#48c78e] text-white px-5 py-3.5 rounded-3xl rounded-tr-sm max-w-[80%] shadow-[0_4px_14px_0_rgba(72,199,142,0.39)] font-medium text-[14px]">
-                      {msg.text}
-                    </div>
-                  </div>
-                ) : (
-                  <div key={idx} className="flex justify-start items-start gap-4 transform transition-all duration-300">
-                    <div className="w-10 h-10 rounded-full bg-gradient-to-br from-rose-400 to-rose-600 flex items-center justify-center text-white shrink-0 shadow-lg shadow-rose-500/30">
-                      <Bot className="w-5 h-5" />
-                    </div>
-                    <div className="bg-[#2c2b3e] text-white px-6 py-5 rounded-3xl rounded-tl-sm max-w-[85%] shadow-md font-medium text-[14px] leading-relaxed whitespace-pre-wrap">
-                      {msg.text}
-                    </div>
-                  </div>
-                )
-              ))}
-
-              {isLoading && (
-                <div className="flex justify-start items-start gap-4">
-                  <div className="w-10 h-10 rounded-full bg-gradient-to-br from-rose-400 to-rose-600 flex items-center justify-center text-white shrink-0 shadow-lg shadow-rose-500/30">
-                    <Bot className="w-5 h-5 animate-pulse" />
-                  </div>
-                  <div className="bg-[#2c2b3e] h-12 w-[80px] rounded-3xl rounded-tl-sm shadow-md flex items-center justify-center gap-1.5 opacity-80">
-                    <span className="w-2 h-2 bg-white rounded-full animate-bounce"></span>
-                    <span className="w-2 h-2 bg-white rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
-                    <span className="w-2 h-2 bg-white rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
-                  </div>
+          <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4 space-y-4">
+            {messages.map((msg, idx) => (
+              <div key={idx} className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[88%] rounded-3xl px-5 py-4 text-sm leading-6 whitespace-pre-wrap ${
+                  msg.sender === 'user'
+                    ? 'bg-emerald-400 text-white'
+                    : msg.sender === 'ai'
+                      ? 'bg-violet-50 border border-violet-100 text-gray-800'
+                      : 'bg-[#202033] text-white'
+                }`}>
+                  {msg.text}
                 </div>
-              )}
-              <div ref={messagesEndRef} className="h-4" />
-            </div>
-            
-            {/* Input Box */}
-            <div className="p-6 bg-white border-t border-gray-50">
-              <div className="relative group">
-                <input 
-                  type="text" 
-                  value={inputValue}
-                  onChange={(e) => setInputValue(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder={isLoading ? "AI가 답변을 작성하고 있습니다..." : "AI 어시스턴트에게 질문해보세요"} 
-                  disabled={isLoading}
-                  className="w-full bg-gray-50 border border-gray-200 rounded-full py-4 pl-6 pr-14 text-[14px] focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 transition-all font-medium placeholder-gray-400 disabled:opacity-60 disabled:bg-gray-100"
-                />
-                <button 
-                  onClick={() => handleSendMessage(inputValue)}
-                  disabled={isLoading || !inputValue.trim()}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 w-10 h-10 bg-[#3a394c] group-hover:bg-blue-600 rounded-full flex items-center justify-center text-white transition-colors duration-300 shadow-md disabled:bg-gray-300 disabled:cursor-not-allowed">
-                  <Send className="w-4 h-4 ml-0.5" />
-                </button>
               </div>
-              <p className="text-center text-[11px] text-gray-400 mt-3 font-semibold">AI 어시스턴트는 실수를 할 수 있습니다</p>
-            </div>
+            ))}
+            {isChatLoading && (
+              <div className="rounded-3xl bg-violet-50 text-violet-700 px-5 py-4 text-sm inline-flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" /> AI 응답 생성 중...
+              </div>
+            )}
+            <div ref={messagesEndRef} />
           </div>
 
-          {/* Right: Side Panels */}
-          <div className="w-full md:w-[420px] bg-[#f8f9fc] p-6 flex flex-col gap-5 shrink-0 border-l border-gray-100">
-            
-            <div className="flex justify-end -mb-1">
-              <button 
-                onClick={handleFetchInsight}
-                className="text-[16px] text-indigo-500 hover:text-indigo-700 font-bold transition-colors underline underline-offset-2 flex items-center gap-1"
-                disabled={isAnalyzing}
-              >
-                <Activity className="w-3 h-3" />
-                현재까지 진행 내용 요약하기
-              </button>
-            </div>
+          <form
+            id="live-ai-chat-form"
+            onSubmit={(e) => {
+              e.preventDefault()
+              handleAskAI()
+            }}
+            className="p-4 border-t border-gray-200 flex gap-2 shrink-0"
+          >
+            <input
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              placeholder="AI 어시스턴트에게 질문하세요"
+              className="flex-1 h-12 rounded-2xl border border-gray-200 px-4 outline-none"
+            />
+            <button disabled={isChatLoading || !inputValue.trim()} className="h-12 w-12 rounded-2xl bg-violet-600 text-white flex items-center justify-center disabled:opacity-50">
+              <Send className="w-5 h-5" />
+            </button>
+          </form>
+        </section>
 
-            <div className="flex-1 min-h-0 overflow-hidden relative flex flex-col">
-              {isAnalyzing ? (
-                <div className="flex-1 flex flex-col items-center justify-center p-6 bg-gradient-to-br from-[#eef2ff] to-[#f8fafc] rounded-3xl border border-indigo-100 shadow-inner">
-                  <div className="relative mb-6">
-                    <div className="absolute inset-0 bg-indigo-400 rounded-full blur-xl animate-pulse opacity-40"></div>
-                    <div className="w-16 h-16 bg-indigo-500 rounded-full flex items-center justify-center relative z-10 shadow-lg shadow-indigo-200 animate-bounce">
-                      <Bot className="w-8 h-8 text-white" />
-                    </div>
-                  </div>
-                  <h3 className="text-[15px] font-extrabold text-indigo-900 mb-3">착착이가 회의를 분석하고 있어요!</h3>
-                  <div className="flex items-center gap-1.5 mb-4">
-                    <span className="w-2 h-2 bg-indigo-400 rounded-full animate-pulse"></span>
-                    <span className="w-2 h-2 bg-indigo-400 rounded-full animate-pulse" style={{ animationDelay: '150ms' }}></span>
-                    <span className="w-2 h-2 bg-indigo-400 rounded-full animate-pulse" style={{ animationDelay: '300ms' }}></span>
-                  </div>
-                  <p className="text-[12px] text-indigo-500/80 font-medium text-center leading-relaxed">
-                    현재까지 진행된 회의 내용을<br/>정리하는 중입니다... 잠시만 기다려주세요.
-                  </p>
-                </div>
-              ) : aiResult ? (
-                <AIInsightPanel aiResult={aiResult} isAnalyzing={isAnalyzing} />
-              ) : (
-                <div className="flex-1 flex flex-col items-center justify-center p-6 bg-white rounded-3xl border-2 border-dashed border-gray-200 hover:border-indigo-300 transition-colors group cursor-default">
-                  <div className="w-16 h-16 bg-[#f3f5fa] group-hover:bg-indigo-50 rounded-2xl rotate-3 group-hover:-rotate-3 transition-all duration-300 flex items-center justify-center mb-5 shadow-sm">
-                    <Sparkles className="w-8 h-8 text-[#86a0d4] group-hover:text-indigo-500 transition-colors" />
-                  </div>
-                  <h3 className="text-[15px] font-bold text-gray-700 mb-2">착착이에게 요약을 요청해보세요!</h3>
-                  <p className="text-[12px] text-gray-400 text-center leading-relaxed font-medium">
-                    우측 상단의 <span className="text-indigo-500 font-bold bg-indigo-50 px-1.5 py-0.5 rounded">현재까지 진행 내용 요약하기</span>를 누르면<br/>
-                    복잡한 회의 내용을 한눈에 정리해 드려요 ✨
-                  </p>
-                </div>
-              )}
-            </div>
+        <section className="min-h-0 flex flex-col overflow-hidden">
+          <div className="h-16 px-6 flex items-center justify-between border-b border-gray-200 shrink-0">
+            <button onClick={handleMidSummary} disabled={isSummaryLoading} className="text-blue-600 font-bold underline">
+              {isSummaryLoading ? '요약 생성 중...' : '현재까지 진행 내용 요약하기'}
+            </button>
+            <button onClick={handleFeedback} disabled={isFeedbackLoading} className="rounded-2xl bg-gray-100 px-4 py-2 text-sm font-bold">
+              {isFeedbackLoading ? '피드백 생성 중...' : '회의 피드백'}
+            </button>
+          </div>
 
-            <div className="bg-white rounded-[2rem] border border-gray-100 shadow-sm p-6 flex flex-col shrink-0">
-              <h3 className="text-[#414d6c] font-extrabold text-[15px] mb-4 flex items-center gap-2">
-                <Bot className="w-4 h-4 text-blue-500" /> 착착이에게 즉시 요청하기
-              </h3>
-              <div className="space-y-2.5 flex-1 flex flex-col justify-center">
-                <button 
-                  onClick={() => handleSendMessage("현재까지 진행 내용 요약이 필요해요")}
-                  disabled={isLoading}
-                  className="w-full text-left px-5 py-3 rounded-2xl border border-gray-100 bg-gray-50 text-gray-700 font-bold text-[13px] hover:border-blue-200 hover:bg-blue-50/50 hover:text-blue-700 transition-all shadow-sm disabled:opacity-50">
+          <div className="flex-1 min-h-0 overflow-y-auto p-6">
+            <div className="rounded-3xl border border-dashed border-gray-300 p-10 text-center text-gray-500">
+              <Bot className="w-10 h-10 mx-auto mb-4 text-violet-400" />
+              <div className="font-bold text-gray-800">착착이에게 즉시 요청하기</div>
+              <div className="text-sm mt-2">
+                좌측 채팅창이나 상단 요약 버튼을 사용하세요.
+              </div>
+
+              <div className="mt-6 grid gap-3 max-w-md mx-auto">
+                <button onClick={handleMidSummary} className="rounded-2xl bg-white border border-gray-200 px-4 py-3 text-sm text-left">
                   📋 현재까지 진행 내용 요약이 필요해요
                 </button>
-                <button 
-                  onClick={() => handleSendMessage("회의가 정체됐어. 어떻게 해결하면 좋을지 제안해줘")}
-                  disabled={isLoading}
-                  className="w-full text-left px-5 py-3 rounded-2xl border border-gray-100 bg-gray-50 text-gray-700 font-bold text-[13px] hover:border-blue-200 hover:bg-blue-50/50 hover:text-blue-700 transition-all shadow-sm disabled:opacity-50">
+                <button onClick={handleFeedback} className="rounded-2xl bg-white border border-gray-200 px-4 py-3 text-sm text-left">
                   💡 회의가 정체됐어요. 제안해 주세요.
                 </button>
-                <button 
-                  onClick={() => handleSendMessage("현재 상황에서 다음 단계(Next Step) 추천이 필요해")}
-                  disabled={isLoading}
-                  className="w-full text-left px-5 py-3 rounded-2xl border border-gray-100 bg-gray-50 text-gray-700 font-bold text-[13px] hover:border-blue-200 hover:bg-blue-50/50 hover:text-blue-700 transition-all shadow-sm disabled:opacity-50">
-                  🚀 다음 스텝(Next Step) 추천이 필요해요
+                <button onClick={() => askPreset('현재 회의 내용을 바탕으로 다음 스텝을 구체적으로 추천해줘')} className="rounded-2xl bg-white border border-gray-200 px-4 py-3 text-sm text-left">
+                  🚀 다음 스텝 추천이 필요해요
                 </button>
               </div>
             </div>
+
+            <div className="mt-6 rounded-3xl border border-gray-200 p-5">
+              <div className="font-bold mb-3">회의 중 자료 업로드</div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <input type="file" onChange={(e) => setMeetingPlanFile(e.target.files?.[0] || null)} className="text-xs" />
+                  <button onClick={handleUploadPlan} disabled={!meetingPlanFile} className="mt-2 rounded-xl bg-violet-600 text-white px-3 py-2 text-xs disabled:opacity-50 inline-flex gap-1 items-center">
+                    <FileUp className="w-3 h-3" /> 계획서 업로드
+                  </button>
+                </div>
+                <div>
+                  <input type="file" onChange={(e) => setKnowledgeFile(e.target.files?.[0] || null)} className="text-xs" />
+                  <button onClick={handleUploadKnowledge} disabled={!knowledgeFile} className="mt-2 rounded-xl bg-blue-600 text-white px-3 py-2 text-xs disabled:opacity-50 inline-flex gap-1 items-center">
+                    <Upload className="w-3 h-3" /> 자료 업로드
+                  </button>
+                </div>
+              </div>
+              {uploadStatus && <div className="mt-3 text-xs text-violet-600">{uploadStatus}</div>}
+            </div>
+          </div>
+        </section>
+
+        <aside className="min-h-0 border-l border-gray-200 flex flex-col">
+          <div className="h-16 px-5 flex items-center justify-between border-b border-gray-200 shrink-0">
+            <div className="font-black">회의 중 녹음본 / STT</div>
+            <button onClick={refreshMeeting} className="text-xs rounded-lg border px-2 py-1">
+              <RefreshCw className="w-3 h-3 inline" /> 갱신
+            </button>
           </div>
 
-        </div>
-
-        {/* Bottom Buttons */}
-        <div className="flex justify-end gap-3 mt-6 pb-2 mr-2">
-          <button className="flex items-center gap-2 px-6 py-3.5 bg-[#404b6b] hover:bg-[#4b587d] text-white font-bold text-[14px] rounded-xl transition-colors shadow-lg">
-             <Pause className="w-4 h-4" fill="currentColor" /> 회의 일시멈춤
-          </button>
-          <button className="flex items-center gap-2 px-6 py-3.5 bg-[#2d7df6] hover:bg-[#2068db] text-white font-bold text-[14px] rounded-xl shadow-[0_0_15px_rgba(45,125,246,0.4)] transition-all transform hover:-translate-y-0.5">
-             <Square className="w-4 h-4 ml-0.5" fill="currentColor" /> 회의 종료
-          </button>
-        </div>
-      
-      </div>
+          <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+            {liveTranscriptItems.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-center text-sm text-gray-400">
+                아직 STT가 없습니다.
+              </div>
+            ) : (
+              liveTranscriptItems.map((item) => (
+                <div key={item.id} className="rounded-2xl bg-gray-50 border border-gray-200 p-3">
+                  <div className="text-xs text-violet-600 font-bold">실시간 STT 기록</div>
+                  <div className="text-sm mt-1 whitespace-pre-wrap">{item.previewLine}</div>
+                </div>
+              ))
+            )}
+            <div ref={transcriptEndRef} />
+          </div>
+        </aside>
+      </main>
     </div>
-  );
+  )
 }

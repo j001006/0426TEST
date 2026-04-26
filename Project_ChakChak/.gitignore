@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+node_modules/
+dist/
+.vite/
+*.sqlite3
+*.db
+backend/data/
+backend/uploads/
+workspace-ui/node_modules/
+workspace-ui/dist/
+.DS_Store
+_backup*

@@ -1,13 +1,15 @@
-const API_URL = "http://localhost:8000";
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 
 export async function generateMindmap(text) {
-  const res = await fetch(`${API_URL}/mindmap`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ text })
-  });
+  const res = await fetch(`${API_BASE_URL}/mindmap`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  })
 
-  return await res.json();
+  if (!res.ok) {
+    throw new Error('마인드맵 생성 실패')
+  }
+
+  return res.json()
 }

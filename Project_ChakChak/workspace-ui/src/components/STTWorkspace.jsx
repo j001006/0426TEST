@@ -1,360 +1,323 @@
-import React, { useEffect, useMemo, useState } from 'react';
-import {
-  uploadTranscription,
-  fetchTranscriptionSessions,
-  fetchTranscriptionDetail,
-} from '../services/sttService';
-import { Upload, Clock3, Mic, PauseCircle, FileAudio } from 'lucide-react';
+import React, { useEffect, useState } from 'react'
+import { BarChart3, Eye, FileAudio, FileText, FolderOpen, Loader2, RefreshCw, Upload } from 'lucide-react'
+import { getGlobalLibraryTree, uploadGlobalKnowledgeFile } from '../services/realtimeMeetingService'
+import { getMeetingTranscript, uploadAudioForMeetingReport } from '../services/meetingReportService'
 
-function formatDateTime(isoString) {
-  const d = new Date(isoString);
-  return `${d.getFullYear()}.${String(d.getMonth() + 1).padStart(2, '0')}.${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api'
 
-function formatSec(sec) {
-  const total = Math.max(0, Math.floor(sec || 0));
-  const mm = String(Math.floor(total / 60)).padStart(2, '0');
-  const ss = String(total % 60).padStart(2, '0');
-  return `${mm}:${ss}`;
-}
+export default function STTWorkspace({ onOpenMeetingReport }) {
+  const [tree, setTree] = useState(null)
+  const [sessions, setSessions] = useState([])
+  const [knowledgeFile, setKnowledgeFile] = useState(null)
+  const [audioFile, setAudioFile] = useState(null)
+  const [sttModel, setSttModel] = useState('medium')
+  const [language, setLanguage] = useState('ko')
+  const [isUploadingKnowledge, setIsUploadingKnowledge] = useState(false)
+  const [isUploadingAudio, setIsUploadingAudio] = useState(false)
+  const [message, setMessage] = useState('')
+  const [selectedTranscript, setSelectedTranscript] = useState(null)
 
-function silenceLabel(state) {
-  switch (state) {
-    case 'micro_pause':
-      return '미세 정적';
-    case 'short_pause':
-      return '짧은 정적';
-    case 'extended_pause':
-      return '긴 정적';
-    case 'stagnation':
-      return '정체 가능';
-    default:
-      return state;
-  }
-}
-
-export default function STTWorkspace() {
-  const [sessions, setSessions] = useState([]);
-  const [selectedId, setSelectedId] = useState(null);
-  const [selectedDetail, setSelectedDetail] = useState(null);
-
-  const [selectedFile, setSelectedFile] = useState(null);
-  const [isUploading, setIsUploading] = useState(false);
-  const [error, setError] = useState('');
-  const [selectedUploadModel, setSelectedUploadModel] = useState('medium');
-
-  const loadSessions = async () => {
+  const refreshTree = async () => {
     try {
-      const data = await fetchTranscriptionSessions();
-      setSessions(data);
-      if (!selectedId && data.length > 0) {
-        setSelectedId(data[0].id);
-      }
-    } catch (e) {
-      console.error(e);
-      setError('세션 목록을 불러오지 못했습니다.');
+      const data = await getGlobalLibraryTree()
+      setTree(data)
+    } catch (error) {
+      console.error(error)
+      setMessage(error.message || '자료함을 불러오지 못했습니다.')
     }
-  };
+  }
+
+  const refreshSessions = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/meeting/sessions`)
+      const data = await res.json()
+      setSessions(data.sessions || [])
+    } catch (error) {
+      console.error(error)
+    }
+  }
+
+  const refreshAll = async () => {
+    await Promise.all([refreshTree(), refreshSessions()])
+  }
 
   useEffect(() => {
-    loadSessions();
-  }, []);
+    refreshAll()
+  }, [])
 
-  useEffect(() => {
-    if (!selectedId) {
-      setSelectedDetail(null);
-      return;
+  const handleKnowledgeUpload = async () => {
+    if (!knowledgeFile) {
+      setMessage('공통 참고 문서를 선택하세요.')
+      return
     }
 
-    const loadDetail = async () => {
-      try {
-        const detail = await fetchTranscriptionDetail(selectedId);
-        setSelectedDetail(detail);
-      } catch (e) {
-        console.error(e);
-        setError('세션 상세를 불러오지 못했습니다.');
-      }
-    };
-
-    loadDetail();
-  }, [selectedId]);
-
-  const handleUpload = async () => {
-    if (!selectedFile) return;
+    setIsUploadingKnowledge(true)
+    setMessage('')
 
     try {
-      setIsUploading(true);
-      setError('');
+      await uploadGlobalKnowledgeFile(knowledgeFile)
+      setKnowledgeFile(null)
+      setMessage('공통 참고 문서 업로드 완료')
+      await refreshAll()
+    } catch (error) {
+      console.error(error)
+      setMessage(error.message || '공통 참고 문서 업로드 실패')
+    } finally {
+      setIsUploadingKnowledge(false)
+    }
+  }
 
-      const result = await uploadTranscription(selectedFile, selectedUploadModel);
-      console.log("upload result:", result);
-
-      await loadSessions();
-
-      const newId = result.session_id ?? result.id;
-    if (!newId) {
-      throw new Error("업로드 응답에 session_id 또는 id가 없습니다.");
+  const handleAudioUpload = async () => {
+    if (!audioFile) {
+      setMessage('회의 녹음 음성/영상 파일을 선택하세요.')
+      return
     }
 
-    setSelectedId(newId);
+    setIsUploadingAudio(true)
+    setSelectedTranscript(null)
+    setMessage(`STT 변환 및 SLM 회의 분석 중입니다. 선택 모델: ${sttModel}`)
 
-    const detail = await fetchTranscriptionDetail(newId);
-    console.log("new detail:", detail);
-    setSelectedDetail(detail);
-
-    setSelectedFile(null);
-  } catch (e) {
-    console.error(e);
-    setError(`음성 업로드 또는 변환 중 오류가 발생했습니다: ${e.message}`);
-  } finally {
-    setIsUploading(false);
+    try {
+      const result = await uploadAudioForMeetingReport(audioFile, { sttModel, language })
+      setAudioFile(null)
+      setMessage(`완료. sessionId=${result.sessionId}`)
+      await refreshAll()
+      onOpenMeetingReport?.(result.sessionId)
+    } catch (error) {
+      console.error(error)
+      setMessage(error.message || '음성파일 업로드/STT 변환 실패')
+    } finally {
+      setIsUploadingAudio(false)
+    }
   }
-};
 
-  const summary = useMemo(() => {
-    if (!selectedDetail) return null;
-    return {
-      duration: formatSec(selectedDetail.total_duration),
-      silence: formatSec(selectedDetail.total_silence),
-      silenceEvents: selectedDetail.silence_events,
-      segmentCount: selectedDetail.segments?.length || 0,
-    };
-  }, [selectedDetail]);
+  const handleViewTranscript = async (sessionId) => {
+    try {
+      const data = await getMeetingTranscript(sessionId)
+      setSelectedTranscript(data)
+    } catch (error) {
+      console.error(error)
+      setMessage(error.message || 'STT transcript 로딩 실패')
+    }
+  }
 
   return (
-    <div className="w-full flex-1 min-h-0 bg-transparent flex flex-col overflow-hidden">
-      <div className="flex-1 p-6 flex flex-col min-h-0">
-        <div className="flex-1 min-h-0 grid grid-cols-[340px_minmax(0,1fr)] gap-6">
-          <div className="flex flex-col gap-4 h-full min-h-0">
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-4">
-              <div className="flex items-center gap-2 mb-2">
-                <Mic className="w-5 h-5 text-blue-600" />
-                <h2 className="text-lg font-bold">STT 업로드</h2>
-              </div>
-              <p className="text-sm text-gray-500 mb-4">
-                업로드 음성과 아이디어 채널의 실시간 회의 STT가 같은 DB에 저장됩니다.
-              </p>
+    <div className="h-full bg-[#f7f8fb] overflow-y-auto">
+      <div className="max-w-7xl mx-auto px-8 py-10">
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h1 className="text-3xl font-black text-gray-900">STT / 자료 보관함</h1>
+            <p className="text-sm text-gray-500 mt-2">
+              회의 중 녹음본, 회의 후 녹음파일, 일반 업로드 문서를 분리해서 봅니다.
+            </p>
+          </div>
+          <button
+            onClick={refreshAll}
+            className="rounded-2xl bg-gray-900 text-white px-4 py-2 text-sm font-bold inline-flex items-center gap-2"
+          >
+            <RefreshCw className="w-4 h-4" />
+            새로고침
+          </button>
+        </div>
 
-              <div className="space-y-3">
-                <label className="block">
-                  <input
-                    type="file"
-                    accept="audio/*"
-                    onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
-                    className="hidden"
-                  />
-                  <div className="w-full rounded-xl border border-dashed border-gray-300 bg-gray-50 px-4 py-4 cursor-pointer hover:bg-gray-100 transition">
-                    <div className="flex items-center gap-3">
-                      <FileAudio className="w-5 h-5 text-gray-500" />
-                      <div className="text-sm">
-                        {selectedFile ? selectedFile.name : '음성 파일 선택'}
-                      </div>
-                    </div>
-                  </div>
-                </label>
+        {message && (
+          <div className="mb-6 rounded-2xl bg-violet-50 text-violet-700 px-5 py-4 text-sm whitespace-pre-wrap">
+            {message}
+          </div>
+        )}
 
-                <div>
-                  <label className="block text-xs text-gray-500 mb-1">파일 변환 모델</label>
-                  <select
-                    value={selectedUploadModel}
-                    onChange={(e) => setSelectedUploadModel(e.target.value)}
-                    className="w-full h-10 rounded-xl border border-gray-200 px-3 bg-white text-sm"
-                  >
-                    <option value="small">small</option>
-                    <option value="medium">medium</option>
-                    <option value="large-v3">large-v3</option>
-                    <option value="large-v3-turbo">large-v3-turbo</option>
-                  </select>
-                </div>
-
-                <button
-                  onClick={handleUpload}
-                  disabled={!selectedFile || isUploading}
-                  className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-blue-600 px-4 py-3 text-white font-medium disabled:opacity-50"
-                >
-                  <Upload className="w-4 h-4" />
-                  {isUploading ? '변환 및 저장 중...' : '업로드 후 저장'}
-                </button>
-
-                {error && (
-                  <div className="text-sm text-red-500">{error}</div>
-                )}
-              </div>
-            </div>
-
-            <div className="bg-white rounded-2xl border border-gray-200 shadow-sm flex-1 min-h-0 overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-100">
-                <h3 className="font-semibold">업로드 기록</h3>
-                <p className="text-xs text-gray-500 mt-1">
-                  실시간 회의 내용과 파일 업로드 결과가 함께 쌓입니다.
+        <div className="grid grid-cols-2 gap-6 mb-8">
+          <section className="bg-white rounded-3xl border border-gray-200 shadow-sm p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <Upload className="w-5 h-5 text-violet-600" />
+              <div>
+                <h2 className="text-lg font-bold">공통 참고 문서 업로드</h2>
+                <p className="text-sm text-gray-500">
+                  평소 SLM과 실시간 회의용 SLM이 함께 참고하는 공통 문서 저장소입니다.
                 </p>
               </div>
+            </div>
 
-              <div className="overflow-y-auto h-full">
-                {sessions.length === 0 ? (
-                  <div className="p-4 text-sm text-gray-500">
-                    아직 저장된 STT 기록이 없습니다.
-                  </div>
-                ) : (
-                  sessions.map((item) => {
-                    const active = item.id === selectedId;
-                    return (
-                      <button
-                        key={item.id}
-                        onClick={() => setSelectedId(item.id)}
-                        className={`w-full text-left px-4 py-4 border-b border-gray-100 transition ${
-                          active ? 'bg-blue-50' : 'hover:bg-gray-50'
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-3 mb-1">
-                          <div className="font-medium text-sm text-gray-900 truncate">
-                            {item.filename}
-                          </div>
-                          <div className="text-[11px] text-gray-500 shrink-0">
-                            {formatDateTime(item.created_at)}
-                          </div>
-                        </div>
+            <input
+              type="file"
+              accept=".txt,.pdf,.docx,.hwp,.json,.csv"
+              onChange={(e) => setKnowledgeFile(e.target.files?.[0] || null)}
+              className="block w-full text-sm"
+            />
+            <div className="text-sm text-gray-700 mt-3">
+              {knowledgeFile ? knowledgeFile.name : '선택된 파일 없음'}
+            </div>
+            <button
+              onClick={handleKnowledgeUpload}
+              disabled={isUploadingKnowledge}
+              className="mt-4 rounded-2xl bg-violet-600 text-white px-4 py-2 text-sm font-bold disabled:opacity-50"
+            >
+              {isUploadingKnowledge ? '업로드 중...' : '업로드'}
+            </button>
+          </section>
 
-                        <div className="flex flex-wrap gap-2 mb-2">
-                          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] text-gray-700">
-                            {item.source_type === 'realtime' ? '실시간 회의' : '파일 업로드'}
-                          </span>
-                          {item.channel_name && (
-                            <span className="rounded-full bg-blue-50 px-2 py-0.5 text-[11px] text-blue-700">
-                              {item.channel_name}
-                            </span>
-                          )}
-                          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] text-gray-700">
-                            {item.status}
-                          </span>
-                          {item.realtime_model_name && (
-                            <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] text-gray-700">
-                              RT {item.realtime_model_name}
-                            </span>
-                          )}
-                          {item.final_model_name && (
-                            <span className="rounded-full bg-gray-100 px-2 py-0.5 text-[11px] text-gray-700">
-                              Final {item.final_model_name}
-                            </span>
-                          )}
-                        </div>
-
-                        <div className="text-xs text-gray-500 mb-2">
-                          길이 {formatSec(item.total_duration)} · 정적 {formatSec(item.total_silence)} · 이벤트 {item.silence_events}개
-                        </div>
-
-                        <div className="text-sm text-gray-600 line-clamp-2 whitespace-pre-line">
-                          {item.preview || '변환 텍스트 미리보기 없음'}
-                        </div>
-                      </button>
-                    );
-                  })
-                )}
+          <section className="bg-white rounded-3xl border border-gray-200 shadow-sm p-6">
+            <div className="flex items-center gap-3 mb-4">
+              <FileAudio className="w-5 h-5 text-blue-600" />
+              <div>
+                <h2 className="text-lg font-bold">회의 후 녹음/영상파일 업로드</h2>
+                <p className="text-sm text-gray-500">
+                  wav, mp3, m4a, webm, mp4, wma, wmv 등을 올려 STT, 회의록, Progress Bar를 생성합니다.
+                </p>
               </div>
             </div>
-          </div>
 
-          <div className="h-full min-h-0 bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden flex flex-col">
-            {!selectedDetail ? (
-              <div className="flex-1 flex items-center justify-center text-gray-400">
-                왼쪽에서 업로드 기록을 선택하세요.
+            <input
+              type="file"
+              accept=".wav,.mp3,.m4a,.webm,.mp4,.aac,.ogg,.flac,.wma,.wmv"
+              onChange={(e) => setAudioFile(e.target.files?.[0] || null)}
+              className="block w-full text-sm"
+            />
+            <div className="text-sm text-gray-700 mt-3">
+              {audioFile ? audioFile.name : '선택된 음성/영상파일 없음'}
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 mt-4">
+              <div>
+                <label className="text-xs font-bold text-gray-500">STT 모델</label>
+                <select
+                  value={sttModel}
+                  onChange={(e) => setSttModel(e.target.value)}
+                  className="w-full h-10 rounded-xl border border-gray-200 px-3 text-sm"
+                >
+                  <option value="base">base 빠름/낮은 정확도</option>
+                  <option value="small">small</option>
+                  <option value="medium">medium 추천</option>
+                  <option value="large-v3">large-v3 고정확도/느림</option>
+                  <option value="large-v3-turbo">large-v3-turbo</option>
+                </select>
               </div>
-            ) : (
-              <>
-                <div className="px-6 py-5 border-b border-gray-100">
+              <div>
+                <label className="text-xs font-bold text-gray-500">언어</label>
+                <select
+                  value={language}
+                  onChange={(e) => setLanguage(e.target.value)}
+                  className="w-full h-10 rounded-xl border border-gray-200 px-3 text-sm"
+                >
+                  <option value="ko">한국어</option>
+                  <option value="en">영어</option>
+                  <option value="auto">자동 감지</option>
+                </select>
+              </div>
+            </div>
+
+            <button
+              onClick={handleAudioUpload}
+              disabled={isUploadingAudio}
+              className="mt-4 rounded-2xl bg-blue-600 text-white px-4 py-2 text-sm font-bold disabled:opacity-50 inline-flex items-center gap-2"
+            >
+              {isUploadingAudio && <Loader2 className="w-4 h-4 animate-spin" />}
+              STT 후 회의 분석 생성
+            </button>
+          </section>
+        </div>
+
+        <section className="bg-white rounded-3xl border border-gray-200 shadow-sm p-6 mb-8">
+          <h2 className="text-xl font-black text-gray-900 mb-4">회의 세션 목록</h2>
+          {sessions.length === 0 ? (
+            <div className="rounded-2xl bg-gray-50 text-gray-400 px-4 py-4 text-sm">
+              저장된 회의 세션이 없습니다.
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {sessions.map((session) => (
+                <div key={session.sessionId} className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
                   <div className="flex items-start justify-between gap-4">
                     <div>
-                      <h2 className="text-2xl font-bold">{selectedDetail.filename}</h2>
-                      <div className="text-sm text-gray-500 mt-1">
-                        생성 시각: {formatDateTime(selectedDetail.created_at)}
-                      </div>
+                      <h3 className="font-bold text-gray-900">{session.title}</h3>
+                      <p className="text-xs text-gray-500 mt-1">
+                        sessionId={session.sessionId} · 상태={session.status} · STT={session.liveRecordingCount} · 종료기록={session.postRecordingCount}
+                      </p>
+                      {session.previewLine && (
+                        <p className="text-sm text-gray-700 mt-2 line-clamp-2">{session.previewLine}</p>
+                      )}
+                    </div>
+                    <div className="flex gap-2 shrink-0">
+                      <button
+                        onClick={() => handleViewTranscript(session.sessionId)}
+                        className="px-3 py-2 rounded-xl bg-white border border-gray-200 text-sm inline-flex items-center gap-2"
+                      >
+                        <Eye className="w-4 h-4" />
+                        STT 보기
+                      </button>
+                      <button
+                        onClick={() => onOpenMeetingReport?.(session.sessionId)}
+                        className="px-3 py-2 rounded-xl bg-blue-600 text-white text-sm inline-flex items-center gap-2"
+                      >
+                        <BarChart3 className="w-4 h-4" />
+                        분석 보기
+                      </button>
                     </div>
                   </div>
-
-                  <div className="flex flex-wrap gap-2 mt-3">
-                    {selectedDetail.realtime_model_name && (
-                      <span className="rounded-full bg-gray-100 px-3 py-1 text-sm text-gray-700">
-                        RT {selectedDetail.realtime_model_name}
-                      </span>
-                    )}
-                    {selectedDetail.final_model_name && (
-                      <span className="rounded-full bg-gray-100 px-3 py-1 text-sm text-gray-700">
-                        Final {selectedDetail.final_model_name}
-                      </span>
-                    )}
-                  </div>
-
-                  {summary && (
-                    <div className="flex flex-wrap gap-3 mt-4">
-                      <div className="rounded-full bg-blue-50 text-blue-700 px-3 py-1 text-sm inline-flex items-center gap-2">
-                        <Clock3 className="w-4 h-4" />
-                        전체 길이 {summary.duration}
-                      </div>
-                      <div className="rounded-full bg-amber-50 text-amber-700 px-3 py-1 text-sm inline-flex items-center gap-2">
-                        <PauseCircle className="w-4 h-4" />
-                        정적 {summary.silence}
-                      </div>
-                      <div className="rounded-full bg-gray-100 text-gray-700 px-3 py-1 text-sm">
-                        정적 이벤트 {summary.silenceEvents}개
-                      </div>
-                      <div className="rounded-full bg-gray-100 text-gray-700 px-3 py-1 text-sm">
-                        세그먼트 {summary.segmentCount}개
-                      </div>
-                    </div>
-                  )}
                 </div>
+              ))}
+            </div>
+          )}
+        </section>
 
-                <div className="flex-1 min-h-0 overflow-y-auto">
-                  <div className="p-6 space-y-6">
-                    <section>
-                      <h3 className="font-semibold mb-3">전체 변환본</h3>
-                      <div className="rounded-2xl border border-gray-200 bg-gray-50 p-4 text-sm space-y-2">
-                        {selectedDetail.merged_timeline?.length ? (
-                          selectedDetail.merged_timeline.map((item, idx) => (
-                            <div
-                              key={`${item.kind}-${idx}-${item.start_sec}`}
-                              className={`rounded-xl px-3 py-3 ${
-                                item.kind === 'speech'
-                                  ? 'bg-white border border-gray-200'
-                                  : 'bg-amber-50 border border-amber-200 text-amber-800'
-                              }`}
-                            >
-                              {item.kind === 'speech' ? (
-                                <div className="leading-6">
-                                  <span className="font-medium text-blue-700">
-                                    [{formatSec(item.start_sec)}~{formatSec(item.end_sec)}] {item.speaker}
-                                  </span>
-                                  <span>: </span>
-                                  <span className="text-gray-800">{item.text}</span>
-                                </div>
-                              ) : (
-                                <div className="leading-6">
-                                  <span className="font-medium">
-                                    [{formatSec(item.start_sec)}~{formatSec(item.end_sec)}] 발화 X
-                                  </span>
-                                  {item.state && (
-                                    <span className="ml-2 text-xs opacity-80">
-                                      ({silenceLabel(item.state)})
-                                    </span>
-                                  )}
-                                </div>
-                              )}
-                            </div>
-                          ))
-                        ) : (
-                          <div className="text-sm text-gray-500">
-                            표시할 전체 타임라인이 없습니다.
-                          </div>
-                        )}
-                      </div>
-                    </section>
-                  </div>
+        {selectedTranscript && (
+          <section className="bg-white rounded-3xl border border-gray-200 shadow-sm p-6 mb-8">
+            <h2 className="text-xl font-black text-gray-900 mb-2">STT 변환 결과</h2>
+            <p className="text-sm text-gray-500 mb-4">{selectedTranscript.diarizationNote}</p>
+            <div className="max-h-[420px] overflow-y-auto rounded-2xl bg-gray-50 border border-gray-200 p-4">
+              {selectedTranscript.transcriptLines?.map((line, idx) => (
+                <div key={idx} className="py-2 border-b border-gray-100 last:border-0">
+                  <span className="text-xs font-bold text-violet-600">[{line.start}~{line.end}]</span>
+                  <span className="ml-2 text-xs font-semibold text-gray-500">{line.speaker}</span>
+                  <span className="ml-2 text-sm text-gray-800">{line.text}</span>
                 </div>
-              </>
-            )}
-          </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        <div className="grid grid-cols-3 gap-6">
+          <Panel title="회의 중 녹음본" icon={<FileAudio className="w-5 h-5 text-violet-600" />} items={tree?.realtimeMeetings || []} empty="표시할 회의 중 녹음본이 없습니다." />
+          <Panel title="회의 후 녹음본" icon={<FileText className="w-5 h-5 text-blue-600" />} items={tree?.postMeetingRecordings || []} empty="표시할 회의 후 녹음본이 없습니다." />
+          <Panel title="업로드 문서" icon={<FolderOpen className="w-5 h-5 text-emerald-600" />} items={tree?.uploadedKnowledge || []} empty="표시할 업로드 문서가 없습니다." />
         </div>
       </div>
     </div>
-  );
+  )
+}
+
+function Panel({ title, icon, items, empty }) {
+  return (
+    <section className="bg-white rounded-3xl border border-gray-200 shadow-sm p-6">
+      <div className="flex items-center gap-2 mb-4">
+        {icon}
+        <h2 className="text-lg font-bold text-gray-900">{title}</h2>
+      </div>
+      <List items={items} empty={empty} />
+    </section>
+  )
+}
+
+function List({ items, empty }) {
+  if (!items || items.length === 0) {
+    return (
+      <div className="rounded-2xl bg-gray-50 text-gray-400 px-4 py-4 text-sm">
+        {empty}
+      </div>
+    )
+  }
+
+  return (
+    <div className="space-y-3">
+      {items.map((item) => (
+        <div key={item.id || item.name} className="rounded-2xl border border-gray-200 bg-gray-50 p-4">
+          <h3 className="text-sm font-bold text-gray-900">{item.title || item.name}</h3>
+          <p className="text-xs text-gray-500 mt-1">{item.kindLabel || item.kind || item.createdAt || item.created_at || ''}</p>
+          {(item.previewLine || item.preview_line) && (
+            <p className="text-sm text-gray-700 mt-2 line-clamp-3">{item.previewLine || item.preview_line}</p>
+          )}
+        </div>
+      ))}
+    </div>
+  )
 }
